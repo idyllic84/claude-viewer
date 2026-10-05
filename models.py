@@ -2,6 +2,12 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import re
+
+_OPAQUE_FIELDS = {'encrypted', 'encrypted_content', 'encryptedContent', 'reasoningOpaque', 'signature'}
+_BINARY_TYPES = {'image', 'input_image', 'output_image', 'image_url', 'input_audio', 'audio', 'video', 'Buffer'}
+_DATA_URI = re.compile(r'data:[a-zA-Z0-9.+/-]+(?:;[a-zA-Z0-9=.+_-]+)*;base64,[a-zA-Z0-9+/=_-]+')
+_ENCODED_JSON_FIELDS = re.compile(r'"(?:mimeType|mime_type|media_type|encrypted|encrypted_content|encryptedContent|reasoningOpaque)"\s*:|"(?:type|encoding)"\s*:\s*"(?:base64|Buffer)"')
 
 
 def timestamp_ms(value, unit=None):
@@ -53,22 +59,84 @@ def blocks(content):
     return result
 
 
+def compact_value(value):
+    """Keep human-readable content; binary/opaque payloads remain only in raw records."""
+    if isinstance(value, str):
+        rendered = _DATA_URI.sub('[binary data retained in original record]', value)
+        # Tool renderers sometimes wrap typed image/result objects in a JSON
+        # string. Do not let their nested base64/opaque fields evade filtering.
+        if rendered.lstrip().startswith(('{', '[')) and _ENCODED_JSON_FIELDS.search(rendered):
+            try:
+                structured = json.loads(rendered)
+            except (ValueError, RecursionError):
+                return rendered
+            if isinstance(structured, (dict, list)):
+                cleaned = compact_value(structured)
+                if cleaned != structured:
+                    return json.dumps(cleaned, ensure_ascii=False, separators=(',', ':'))
+        return rendered
+    if isinstance(value, list):
+        return [compact_value(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get('_omitted'):
+        return dict(value)
+    kind = value.get('type', value.get('kind'))
+    mime = value.get('mimeType', value.get('mime_type', value.get('media_type', '')))
+    encoded = kind == 'base64' or value.get('encoding') == 'base64'
+    binary = (isinstance(kind, str) and kind in _BINARY_TYPES) or encoded or (
+        isinstance(mime, str) and mime.startswith(('image/', 'audio/', 'video/')))
+    result = {}
+    for key, child in value.items():
+        opaque = key in _OPAQUE_FIELDS and not isinstance(child, (bool, int, float, type(None)))
+        binary_payload = binary and key in ('data', 'bytes', 'buffer', 'value', 'url', 'image_url')
+        if opaque or binary_payload:
+            result[key] = {'_omitted': 'opaque' if opaque else 'binary',
+                           'size': len(child) if isinstance(child, (str, bytes, list)) else None,
+                           'retainedInRawRecord': True}
+        else:
+            result[key] = compact_value(child)
+    return result
+
+
+def _search_value(value):
+    if isinstance(value, str):
+        return _DATA_URI.sub('', value)
+    if isinstance(value, list):
+        return '\n'.join(_search_value(v) for v in value)
+    if isinstance(value, dict):
+        if value.get('_omitted'):
+            return ''
+        parts = []
+        for key, child in value.items():
+            if key in _OPAQUE_FIELDS or key in ('type', 'kind', '$mid'):
+                continue
+            rendered = _search_value(child)
+            if rendered:
+                parts.append(f'{key}: {rendered}')
+        return '\n'.join(parts)
+    return '' if value is None or isinstance(value, bool) else str(value)
+
+
 def searchable_text(content):
     parts = []
-    for block in content:
+    for block in compact_value(content):
         kind = block.get('type')
         if kind == 'text':
-            parts.append(text(block.get('text')))
+            parts.append(_search_value(block.get('text')))
         elif kind == 'thinking':
-            parts.append(text(block.get('thinking')))
+            parts.append(_search_value(block.get('thinking')))
         elif kind == 'tool_use':
-            parts.extend([text(block.get('name')), text(block.get('input'))])
+            parts.extend([text(block.get('name')), _search_value(block.get('input'))])
         elif kind == 'tool_result':
-            value = block.get('content')
-            parts.append(searchable_text(blocks(value)) if isinstance(value, list) else text(value))
-        elif kind not in ('image', 'input_image', 'output_image', 'encrypted_reasoning'):
-            parts.append(text(block))
-    return '\n'.join(parts)
+            parts.append(_search_value(block.get('content')))
+        elif kind == 'request_result':
+            summary = block.get('value') or {}
+            if isinstance(summary, dict):
+                parts.extend(_search_value(summary.get(k)) for k in ('errorDetails', 'error'))
+        elif kind not in _BINARY_TYPES and kind not in ('encrypted_reasoning', 'request_result'):
+            parts.append(_search_value(block))
+    return '\n'.join(p for p in parts if p)
 
 
 @dataclass
@@ -89,7 +157,7 @@ class SessionDocument:
 
     def add(self, record_index, role, content, *, native_id=None, parent_id=None,
             timestamp=None, timestamp_unit=None, kind=None, **metadata):
-        content = blocks(content)
+        content = compact_value(blocks(content))
         if kind is None:
             types = {b.get('type') for b in content}
             kind = 'tool-result' if types == {'tool_result'} else (

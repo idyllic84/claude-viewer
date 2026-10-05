@@ -18,6 +18,14 @@ class SnapshotRecords(list):
         self.byte_count = 0
         self.modified_ns = None
         self.dependencies = {}
+        self.record_sizes = {}
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        hasher = state.pop('hasher', None)
+        if hasher is not None:
+            state['snapshot_digest'] = hasher.digest()
+        return state
 
     @classmethod
     def from_json(cls, path, value):
@@ -26,11 +34,15 @@ class SnapshotRecords(list):
         records.hasher = value.snapshot_hasher
         records.byte_count = value.snapshot_byte_count
         records.modified_ns = value.snapshot_modified_ns
+        records.record_sizes[0] = value.snapshot_byte_count
         return records
 
 
 class SnapshotObject(dict):
-    pass
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state.pop('snapshot_hasher', None)
+        return state
 
 
 @dataclass(frozen=True)
@@ -70,9 +82,12 @@ class SourceFile:
                     raise SourceError('Source snapshot was truncated; retry sync')
                 actual.update(chunk)
                 remaining -= len(chunk)
-        if actual.digest() != records.hasher.digest():
+        expected = getattr(records, 'snapshot_digest', None)
+        if expected is None:
+            expected = records.hasher.digest()
+        if actual.digest() != expected:
             raise SourceError('Source snapshot prefix was rewritten; retry sync')
-        digest = records.hasher.copy()
+        digest = actual.copy()
         for path in self.dependencies:
             expected = records.dependencies.get(str(path))
             if expected is None or path.read_bytes() != expected:
@@ -89,6 +104,7 @@ def read_records(path):
         for index, line in enumerate(stream):
             records.hasher.update(line)
             records.byte_count += len(line)
+            records.record_sizes[index] = len(line)
             if not line.strip():
                 continue
             try:
@@ -122,7 +138,7 @@ def read_json(path, keep_bytes=False):
 class SourceAdapter:
     source = ''
     label = ''
-    parser_version = 1
+    parser_version = 2
 
     def __init__(self, roots):
         self.roots = [Path(os.path.expandvars(str(root))).expanduser().resolve() for root in roots]

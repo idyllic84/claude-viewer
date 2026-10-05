@@ -1,17 +1,31 @@
-"""Viewer-owned SQLite archive. Never opens or migrates an agent's database."""
+"""Viewer-owned archive v2: compressed JSON, shared text, position-free trigram FTS."""
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+from codec import pack_json, unpack_json
 from models import searchable_text
 
-SCHEMA_VERSION = 1
-ARCHIVE_APPLICATION_ID = 0x43565732  # CVW2: reject accidental agent/foreign database paths.
+SCHEMA_VERSION = 2
+ARCHIVE_APPLICATION_ID = 0x43565732
 
 
 def encode(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def trigram_query(query):
+    """detail=none accepts only three-character tokens, not long phrase queries.
+
+    AND a bounded set of grams to select candidates; literal LIKE verifies exact
+    order/adjacency, preserving punctuation, CJK and true substring semantics.
+    """
+    grams = list(dict.fromkeys(query[i:i + 3] for i in range(len(query) - 2)))
+    if len(grams) > 32:
+        grams = [grams[i * (len(grams) - 1) // 31] for i in range(32)]
+    return ' AND '.join('"' + gram.replace('"', '""') + '"' for gram in grams)
 
 
 class Database:
@@ -39,13 +53,15 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.get_connection() as conn:
             version = conn.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, SCHEMA_VERSION):
-                raise ValueError(f'Unsupported archive schema version: {version}')
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
             application_id = conn.execute('PRAGMA application_id').fetchone()[0]
             if (tables and application_id != ARCHIVE_APPLICATION_ID) or (
                     not tables and application_id not in (0, ARCHIVE_APPLICATION_ID)):
                 raise ValueError('Not a viewer-owned archive; existing databases will not be modified')
+            if version == 1:
+                raise ValueError('Archive schema v1 requires rebuilding. Stop the viewer and run python rebuild.py')
+            if version not in (0, SCHEMA_VERSION):
+                raise ValueError(f'Unsupported archive schema version: {version}')
             conn.execute(f'PRAGMA application_id = {ARCHIVE_APPLICATION_ID}')
             conn.execute('PRAGMA journal_mode = WAL')
             conn.executescript('''
@@ -60,15 +76,24 @@ class Database:
                 CREATE INDEX IF NOT EXISTS sessions_source_project ON sessions(source, project);
                 CREATE TABLE IF NOT EXISTS raw_records (
                     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                    record_index INTEGER NOT NULL, raw_json TEXT NOT NULL,
+                    record_index INTEGER NOT NULL, raw_json BLOB NOT NULL,
                     PRIMARY KEY (session_id, record_index)
                 );
                 CREATE TABLE IF NOT EXISTS messages (
-                    id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    message_pk INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE,
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
                     order_id INTEGER NOT NULL, native_id TEXT, parent_id TEXT,
-                    raw_record INTEGER NOT NULL, normalized_json TEXT NOT NULL, search_text TEXT NOT NULL,
-                    PRIMARY KEY (session_id, order_id)
+                    raw_record INTEGER NOT NULL, normalized_json BLOB NOT NULL,
+                    UNIQUE (session_id, order_id)
                 );
+                CREATE TABLE IF NOT EXISTS search_content (
+                    content_id INTEGER PRIMARY KEY, digest BLOB NOT NULL UNIQUE, search_text TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS message_texts (
+                    message_pk INTEGER PRIMARY KEY REFERENCES messages(message_pk) ON DELETE CASCADE,
+                    content_id INTEGER NOT NULL REFERENCES search_content(content_id)
+                );
+                CREATE INDEX IF NOT EXISTS message_texts_content ON message_texts(content_id);
                 CREATE TABLE IF NOT EXISTS source_files (
                     path TEXT PRIMARY KEY, source TEXT NOT NULL, session_id TEXT NOT NULL,
                     fingerprint TEXT NOT NULL, parser_version INTEGER NOT NULL,
@@ -77,17 +102,18 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS source_files_session ON source_files(session_id);
             ''')
-            # Trigram preserves substring semantics, including CJK. Short queries use literal LIKE.
             try:
-                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(search_text, content='messages', content_rowid='rowid', tokenize='trigram')")
-                new_index = not conn.execute("SELECT 1 FROM sqlite_master WHERE name='messages_search_insert'").fetchone()
+                conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(
+                    search_text, content='search_content', content_rowid='content_id',
+                    tokenize='trigram', detail=none, columnsize=0)""")
+                new_index = not conn.execute("SELECT 1 FROM sqlite_master WHERE name='content_search_insert'").fetchone()
                 conn.executescript('''
-                    CREATE TRIGGER IF NOT EXISTS messages_search_insert AFTER INSERT ON messages BEGIN
-                        INSERT INTO message_search(rowid, search_text) VALUES (new.rowid, new.search_text);
+                    CREATE TRIGGER IF NOT EXISTS content_search_insert AFTER INSERT ON search_content BEGIN
+                        INSERT INTO message_search(rowid, search_text) VALUES (new.content_id, new.search_text);
                     END;
-                    CREATE TRIGGER IF NOT EXISTS messages_search_delete AFTER DELETE ON messages BEGIN
+                    CREATE TRIGGER IF NOT EXISTS content_search_delete AFTER DELETE ON search_content BEGIN
                         INSERT INTO message_search(message_search, rowid, search_text)
-                        VALUES ('delete', old.rowid, old.search_text);
+                        VALUES ('delete', old.content_id, old.search_text);
                     END;
                 ''')
                 if new_index:
@@ -102,7 +128,7 @@ class Database:
             return {r['path']: dict(r) for r in conn.execute('SELECT * FROM source_files')}
 
     def replace_session(self, document, path, fingerprint, modified, parser_version, files):
-        """Projection, raw records, file watermarks and FTS change in ONE transaction."""
+        """Raw blobs, projection, shared text/FTS and watermarks commit atomically."""
         with self.get_connection() as conn:
             conn.execute('''INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(id) DO UPDATE SET project=excluded.project, name=excluded.name,
@@ -112,13 +138,38 @@ class Database:
                 (document.id, document.source, document.external_id, document.project, document.name,
                  len(document.messages), modified, str(path), fingerprint, parser_version,
                  encode(document.metadata), encode(document.warnings)))
+            old_content = [r[0] for r in conn.execute('''SELECT DISTINCT t.content_id FROM message_texts t
+                JOIN messages m ON m.message_pk=t.message_pk WHERE m.session_id=?''', (document.id,))]
             conn.execute('DELETE FROM messages WHERE session_id=?', (document.id,))
+            # Do not delete shared content still used by another session/message.
+            conn.executemany('''DELETE FROM search_content WHERE content_id=? AND NOT EXISTS
+                (SELECT 1 FROM message_texts WHERE message_texts.content_id=search_content.content_id)''',
+                ((content_id,) for content_id in old_content))
             conn.execute('DELETE FROM raw_records WHERE session_id=?', (document.id,))
+            sizes = getattr(document.records, 'record_sizes', {})
             conn.executemany('INSERT INTO raw_records VALUES (?, ?, ?)',
-                             ((document.id, i, encode(r)) for i, r in document.records))
+                ((document.id, i, pack_json(r, streaming=sizes.get(i, 0) > 64 * 1024))
+                 for i, r in document.records))
+            first_pk = conn.execute('SELECT COALESCE(MAX(message_pk), 0)+1 FROM messages').fetchone()[0]
             conn.executemany('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                ((m['id'], document.id, order, m['uuid'], m.get('parentUuid'), m['rawRecord'], encode(m),
-                  searchable_text(m['message']['content'])) for order, m in enumerate(document.messages)))
+                ((first_pk + order, m['id'], document.id, order, m['uuid'], m.get('parentUuid'),
+                  m['rawRecord'], pack_json(m)) for order, m in enumerate(document.messages)))
+            content_cache = {}
+            for order, message in enumerate(document.messages):
+                search = searchable_text(message['message']['content'])
+                if not search.strip():
+                    continue
+                digest = hashlib.sha256(search.encode('utf-8')).digest()
+                content_id = content_cache.get(digest)
+                if content_id is None:
+                    row = conn.execute('SELECT content_id FROM search_content WHERE digest=?', (digest,)).fetchone()
+                    if row:
+                        content_id = row[0]
+                    else:
+                        cursor = conn.execute('INSERT INTO search_content(digest,search_text) VALUES (?,?)', (digest, search))
+                        content_id = cursor.lastrowid
+                    content_cache[digest] = content_id
+                conn.execute('INSERT INTO message_texts VALUES (?,?)', (first_pk + order, content_id))
             self._store_files(conn, files)
 
     @staticmethod
@@ -162,15 +213,15 @@ class Database:
             clauses.append('s.source=?'); params.append(source)
         if query:
             pattern = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-            if self.has_trigram and len(query) >= 3:
-                match = '"' + query.replace('"', '""') + '"'
-                message_clause = '''s.id IN (SELECT m.session_id FROM message_search f
-                    JOIN messages m ON m.rowid=f.rowid WHERE message_search MATCH ?
-                    AND m.search_text LIKE ? ESCAPE '\\')'''
-                message_params = [match, pattern]
+            from_text = 'search_content c JOIN message_texts t ON t.content_id=c.content_id JOIN messages m ON m.message_pk=t.message_pk'
+            if self.has_trigram and len(query) >= 3 and '\x00' not in query:
+                from_text = 'message_search f JOIN search_content c ON c.content_id=f.rowid JOIN message_texts t ON t.content_id=c.content_id JOIN messages m ON m.message_pk=t.message_pk'
+                condition = "message_search MATCH ? AND c.search_text LIKE ? ESCAPE '\\'"
+                message_params = [trigram_query(query), pattern]
             else:
-                message_clause = "s.id IN (SELECT session_id FROM messages WHERE search_text LIKE ? ESCAPE '\\')"
+                condition = "c.search_text LIKE ? ESCAPE '\\'"
                 message_params = [pattern]
+            message_clause = f's.id IN (SELECT m.session_id FROM {from_text} WHERE {condition})'
             clauses.append(f"({message_clause} OR s.name LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\' OR s.external_id LIKE ? ESCAPE '\\')")
             params.extend(message_params + [pattern, pattern, pattern])
         where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
@@ -205,14 +256,13 @@ class Database:
                     ORDER BY order_id LIMIT ? OFFSET ?''', (session_id, limit, offset)).fetchall()
                 total = session['messageCount']
             else:
-                # Avoid SQLite's variable limit for large branches; page the order IDs first.
                 branch_orders.sort(); total = len(branch_orders)
                 selected = branch_orders[offset:offset + limit]
                 rows = [conn.execute('SELECT normalized_json, order_id FROM messages WHERE session_id=? AND order_id=?',
                                      (session_id, order)).fetchone() for order in selected]
             items = []
             for row in rows:
-                message = json.loads(row['normalized_json']); message['orderId'] = row['order_id']
+                message = unpack_json(row['normalized_json']); message['orderId'] = row['order_id']
                 items.append(message)
             return {'items': items, 'total': total, 'session': session,
                     'nextCursor': offset + len(items) if offset + len(items) < total else None}
@@ -222,14 +272,14 @@ class Database:
             row = conn.execute('SELECT * FROM messages WHERE id=?', (message_id,)).fetchone()
             if row is None:
                 return None
-            normalized = json.loads(row['normalized_json'])
+            normalized = unpack_json(row['normalized_json'])
             indices = [row['raw_record'], *normalized.get('relatedRawRecords', [])]
             records = []
             for index in dict.fromkeys(indices):
                 raw = conn.execute('SELECT raw_json FROM raw_records WHERE session_id=? AND record_index=?',
                                    (row['session_id'], index)).fetchone()
                 if raw:
-                    records.append({'recordIndex': index, 'record': json.loads(raw[0])})
+                    records.append({'recordIndex': index, 'record': unpack_json(raw[0])})
             path = conn.execute('SELECT path FROM sessions WHERE id=?', (row['session_id'],)).fetchone()[0]
             return {'sourcePath': path, 'sourceLocator': normalized.get('sourceLocator'), 'records': records}
 
@@ -240,5 +290,5 @@ class Database:
             total = conn.execute('SELECT COUNT(*) FROM raw_records WHERE session_id=?', (session_id,)).fetchone()[0]
             rows = conn.execute('''SELECT record_index, raw_json FROM raw_records WHERE session_id=?
                 ORDER BY record_index LIMIT ? OFFSET ?''', (session_id, limit, offset)).fetchall()
-            return {'items': [{'recordIndex': r[0], 'record': json.loads(r[1])} for r in rows], 'total': total,
+            return {'items': [{'recordIndex': r[0], 'record': unpack_json(r[1])} for r in rows], 'total': total,
                     'nextCursor': offset + len(rows) if offset + len(rows) < total else None}

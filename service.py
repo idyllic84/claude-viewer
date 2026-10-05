@@ -1,5 +1,6 @@
 """Read-only multi-source discovery and atomic, idempotent archive sync."""
 from collections import defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 from threading import Lock, Thread
 from copy import deepcopy
@@ -7,6 +8,7 @@ import time
 from db import Database
 from sources import default_adapters
 from sources.base import SourceError
+from sync_cache import ProjectionCache
 
 
 class SyncBusy(RuntimeError):
@@ -100,7 +102,9 @@ class ClaudeViewerService:
 
     def _sync_sessions_locked(self):
         result = {'added': 0, 'updated': 0, 'unchanged': 0, 'failed': 0, 'errors': [], 'warnings': []}
+        resources = ExitStack()
         try:
+            cache = resources.enter_context(ProjectionCache())
             states = self._db.file_states()
             groups = defaultdict(list)
             discovered = set()
@@ -139,9 +143,10 @@ class ClaudeViewerService:
                             modified = document.records.modified_ns // 1_000_000
                         sid = state['session_id'] if cached else document.id
                         count = state['message_count'] if cached else len(document.messages)
-                        # Keep only candidate metadata, not every parsed transcript. A full archive
-                        # can be gigabytes; at most one document should remain in memory at a time.
-                        groups[sid].append({'adapter': adapter, 'entry': entry,
+                        # Spool changed projections privately, keeping only one document in RAM.
+                        # Winners are loaded rather than parsing/replaying large inputs twice.
+                        projection = cache.save(document) if document is not None else None
+                        groups[sid].append({'adapter': adapter, 'entry': entry, 'projection': projection,
                                             'fingerprint': fingerprint, 'modified': modified, 'count': count})
                         document = None
                     except Exception as exc:
@@ -182,11 +187,12 @@ class ClaudeViewerService:
                         self._db.update_files(files)
                         result['unchanged'] += 1
                     else:
-                        document = adapter.parse(entry)
+                        document = (cache.load(winner['projection']) if winner['projection'] is not None
+                                    else adapter.parse(entry))
                         if document.id != sid:
                             raise SourceError('Source session identity changed; retry sync')
-                        # Import the fresh read, not the earlier discovery hash. Appends during
-                        # a long import are valid; edits to already-read bytes are not.
+                        # Validate the captured snapshot. Later appends are picked up on the
+                        # next sync; edits/truncations to this snapshot must still be rejected.
                         fingerprint = entry.snapshot_fingerprint(document.records)
                         modified = document.records.modified_ns // 1_000_000
                         files = [(path, source, session, fingerprint if path == str(entry.path) else fp,
@@ -231,9 +237,12 @@ class ClaudeViewerService:
                 self._status['progress']['phase'] = 'failed'
             raise
         finally:
-            with self._status_lock:
-                self._status['running'] = False
-            self._sync_lock.release()
+            try:
+                resources.close()
+            finally:
+                with self._status_lock:
+                    self._status['running'] = False
+                self._sync_lock.release()
 
     def sync_sessions_from_claude_files(self):
         """Compatibility name. Syncs all configured sources and returns real statistics."""

@@ -76,9 +76,81 @@ def replay_operations(records):
     return state
 
 
+def _native_call_id(key):
+    # VS Code qualifies model call IDs with a transport timestamp. Strip only
+    # this known namespace, not arbitrary suffixes or text-similar tool names.
+    base, separator, suffix = key.rpartition('__vscode-')
+    return base if separator and suffix.isdigit() else key
+
+
+def _tool_definitions(metadata):
+    definitions = {}
+    for round_data in metadata.get('toolCallRounds') or []:
+        if not isinstance(round_data, dict):
+            continue
+        for call in round_data.get('toolCalls') or []:
+            if isinstance(call, dict):
+                cid = call.get('id') or call.get('toolCallId')
+                if cid:
+                    definitions[cid] = call
+    return definitions
+
+
+def _arguments(call, fallback):
+    import json
+    function = call.get('function')
+    value = call.get('arguments', function.get('arguments', fallback) if isinstance(function, dict) else fallback)
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _result_content(value):
+    if isinstance(value, dict) and isinstance(value.get('content'), list):
+        result = []
+        for part in value['content']:
+            if isinstance(part, dict) and 'type' not in part and isinstance(part.get('value'), str):
+                result.append({'type': 'text', 'text': part['value']})
+            else:
+                result.extend(blocks([part]))
+        return result
+    return value
+
+
+def _result_summary(result):
+    """Status/usage/error only. Never copy rounds, rendered context or tool results."""
+    if not isinstance(result, dict):
+        return {'details': text(result)[:4096], 'fullResultInRawRecord': True}
+    summary = {'fullResultInRawRecord': True}
+    for key in ('details', 'isIncomplete', 'isCancelled', 'isError', 'status'):
+        value = result.get(key)
+        if isinstance(value, (str, int, float, bool)):
+            summary[key] = value[:4096] if isinstance(value, str) else value
+    for key in ('errorDetails', 'error'):
+        value = result.get(key)
+        if isinstance(value, dict):
+            summary[key] = {k: v[:8192] if isinstance(v, str) else v for k, v in value.items()
+                            if k in ('message', 'code', 'name', 'responseIsIncomplete', 'isRateLimited')
+                            and isinstance(v, (str, int, float, bool))}
+        elif isinstance(value, str):
+            summary[key] = value[:8192]
+    timings = result.get('timings')
+    if isinstance(timings, dict):
+        summary['timings'] = {k: v for k, v in timings.items() if isinstance(v, (int, float))}
+    metadata = result.get('metadata')
+    if isinstance(metadata, dict):
+        summary['usage'] = {k: metadata[k] for k in ('promptTokens', 'outputTokens', 'cachedPromptTokens',
+                           'totalTokens', 'resolvedModel') if isinstance(metadata.get(k), (str, int, float))}
+    return summary
+
+
 class VSCodeChatAdapter(SourceAdapter):
     source = 'vscode_chat'
     label = 'VS Code Chat'
+    parser_version = 2
 
     def discover(self):
         entries = []
@@ -132,6 +204,16 @@ class VSCodeChatAdapter(SourceAdapter):
             content = blocks(user.get('text')) if isinstance(user, dict) else blocks(user)
             if content:
                 doc.add(raw, 'user', content, native_id=rid, **common)
+            result = request.get('result') or {}
+            metadata = result.get('metadata') if isinstance(result, dict) else None
+            metadata = metadata if isinstance(metadata, dict) else {}
+            mapped_results = metadata.get('toolCallResults') or {}
+            mapped_results = mapped_results if isinstance(mapped_results, dict) else {}
+            definitions = _tool_definitions(metadata)
+            by_native_id = {}
+            for key in mapped_results:
+                by_native_id.setdefault(_native_call_id(key), []).append(key)
+            used_results = set()
             response = request.get('response') or []
             if isinstance(response, str):
                 response = [{'value': response}]
@@ -151,18 +233,49 @@ class VSCodeChatAdapter(SourceAdapter):
                         chunk.get('value', chunk.get('text', chunk.get('thinking', ''))))}], kind='thinking', **args)
                 elif kind == 'toolInvocationSerialized':
                     call_id = chunk.get('toolCallId')
+                    candidates = ([call_id] if call_id in mapped_results else by_native_id.get(call_id, []))
+                    result_key = candidates[0] if len(candidates) == 1 else None
+                    definition = definitions.get(call_id, {})
+                    specific = chunk.get('toolSpecificData')
+                    fallback = specific if specific is not None else chunk.get('invocationMessage')
+                    if isinstance(specific, dict) and specific.get('kind') == 'terminal':
+                        fallback = {k: v for k, v in specific.items() if k in
+                                    ('kind', 'command', 'commandLine', 'cwd', 'language', 'isBackground',
+                                     'requestUnsandboxedExecution', 'requestAllowNetwork')}
                     doc.add(raw, 'assistant', [{'type': 'tool_use', 'id': call_id,
-                            'name': chunk.get('toolId', chunk.get('toolName', 'tool')),
-                            'input': chunk.get('toolSpecificData', chunk.get('invocationMessage'))}],
+                            'name': definition.get('name', chunk.get('toolId', chunk.get('toolName', 'tool'))),
+                            'input': _arguments(definition, fallback)}],
                             toolCallId=call_id, status=chunk.get('isComplete'), **args)
-                    if chunk.get('resultDetails') is not None:
+                    output = None
+                    output_args = args
+                    if result_key is not None:
+                        used_results.add(result_key)
+                        output = _result_content(mapped_results[result_key])
+                        output_args = {**args, 'sourceLocator': {**args['sourceLocator'],
+                                       'metadataToolCallResultKey': result_key}}
+                    elif chunk.get('resultDetails') is not None:
+                        output = chunk['resultDetails']
+                    elif isinstance(specific, dict) and specific.get('terminalCommandOutput') is not None:
+                        output = specific['terminalCommandOutput']
+                    if output is not None:
                         doc.add(raw, 'tool', [{'type': 'tool_result', 'tool_use_id': call_id,
-                                'content': chunk['resultDetails']}], toolCallId=call_id, **args)
+                                'content': output}], toolCallId=call_id, **output_args)
                 else:
                     # Keep references, edits, questions and future chunk kinds as structured blocks.
                     doc.add(raw, 'system', [{'type': kind, 'value': chunk}], **args)
-            if request.get('result'):
-                result = request['result']
-                doc.add(raw, 'system', [{'type': 'request_result', 'value': result}],
+            # Some UI calls use different IDs than the model. Preserve unpaired
+            # outputs as separate, explicitly unpaired records instead of guessing.
+            for key, value in mapped_results.items():
+                if key in used_results:
+                    continue
+                native_id = _native_call_id(key)
+                doc.add(raw, 'tool', [{'type': 'tool_result', 'tool_use_id': native_id,
+                        'content': _result_content(value)}], native_id=f'{rid}:result:{key}',
+                        toolCallId=native_id, unpaired=True,
+                        sourceLocator={'requestIndex': request_index, 'metadataToolCallResultKey': key},
+                        timestamp=timestamp, timestamp_unit='ms', model=request.get('modelId'),
+                        nativeType='metadata_tool_result')
+            if result:
+                doc.add(raw, 'system', [{'type': 'request_result', 'value': _result_summary(result)}],
                         native_id=f'{rid}:result', **common)
         return doc.finish()

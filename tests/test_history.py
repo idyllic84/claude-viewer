@@ -285,7 +285,7 @@ class ArchiveTests(FixtureCase):
             nonlocal calls
             document = original(entry)
             calls += 1
-            if calls == 2:
+            if calls == 1:
                 with path.open('a', encoding='utf-8') as stream:
                     stream.write(json.dumps({'type': 'message', 'id': 'a', 'parentId': 'u',
                         'message': {'role': 'assistant', 'content': 'newly appended'}}) + '\n')
@@ -295,6 +295,7 @@ class ArchiveTests(FixtureCase):
             result = service.sync_sessions()
         self.assertEqual(result['added'], 1)
         self.assertEqual(result['failed'], 0)
+        self.assertEqual(calls, 1)  # Winning projection is spooled, not parsed twice.
         self.assertEqual(service.get_messages('pi:shared')['total'], 1)
         self.assertEqual(service.sync_sessions()['updated'], 1)
         self.assertEqual(service.get_messages('pi:shared')['total'], 2)

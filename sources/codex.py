@@ -11,6 +11,7 @@ from .base import SourceAdapter, SourceError, read_records
 class CodexAdapter(SourceAdapter):
     source = 'codex'
     label = 'Codex'
+    parser_version = 2
 
     def parse(self, entry):
         records, warnings = read_records(entry.path)
@@ -40,7 +41,36 @@ class CodexAdapter(SourceAdapter):
         start = header.get('subagent_history_start_ordinal')
         if start is not None:
             doc.metadata['inheritedContextBoundary'] = start
-        local = [(i, r) for i, r in records if start is None or r.get('ordinal', i) >= start]
+        # Migrated historical child logs may set the boundary to EOF even though
+        # their completed events belong to this child. Explicit thread/turn
+        # ownership is stronger evidence than that model-context boundary.
+        owned_turns = {p.get('turn_id') for _, r in records
+                       if r.get('type') == 'event_msg'
+                       and isinstance((p := r.get('payload')), dict)
+                       and p.get('type') == 'item_completed'
+                       and p.get('thread_id') == header['id'] and p.get('turn_id')}
+        local = []
+        current_turn = None
+        recovered = 0
+        for index, row in records:
+            payload = row.get('payload') or {}
+            if not isinstance(payload, dict):
+                continue
+            outer, event = row.get('type'), payload.get('type')
+            if outer == 'turn_context' or (outer == 'event_msg' and event == 'task_started'):
+                current_turn = payload.get('turn_id')
+            explicit_thread = payload.get('thread_id') if outer == 'event_msg' else None
+            foreign = explicit_thread is not None and explicit_thread != header['id']
+            own = explicit_thread == header['id'] or payload.get('turn_id') in owned_turns
+            in_owned_turn = current_turn in owned_turns
+            beyond_boundary = start is None or row.get('ordinal', index) >= start
+            if not foreign and (beyond_boundary or own or in_owned_turn):
+                local.append((index, row))
+                recovered += not beyond_boundary
+            if outer == 'event_msg' and event in ('task_complete', 'turn_aborted'):
+                current_turn = None
+        if recovered:
+            doc.metadata['recoveredPreBoundaryRecords'] = recovered
         completed = []
         calls = {}
         for index, row in local:

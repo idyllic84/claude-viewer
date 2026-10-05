@@ -29,20 +29,66 @@ python server.py --no-sync    # explicitly skip startup sync and browse the exis
 python server.py --debug      # development mode, without the double-import reloader
 ```
 
-The new archive is **`viewer.db`**. Your existing **`claude.db` is preserved and
-is not automatically migrated**. Agent history files are never modified, and
+The current archive is **`viewer.db` (schema v2)**. Your existing **`claude.db` is
+preserved and is not automatically migrated. An older schema-v1 `viewer.db`
+requires the explicit rebuild below; it is never silently overwritten.
+Agent history files are never modified, and
 all source deletion endpoints are disabled, including Claude deletion.
 The UI reports import errors without discarding the last successful projection.
 Active JSONL files may keep appending: the importer validates the exact byte prefix
 it read, commits that snapshot, and picks up later appended records on the next
 sync. Rewrites or truncation of that prefix are still rejected.
 
+## Rebuilding an older viewer index
+
+Stop the viewer, then run:
+
+```bash
+python rebuild.py
+```
+
+The command builds a separate v2 archive, checks SQLite/foreign keys/search-index
+integrity and existing session-ID coverage, then switches the database. The old
+viewer index is retained as `viewer.backup-<timestamp>.db` for rollback. Agent
+files and the old Claude-only database are untouched. Failed builds keep the
+original database and the candidate for inspection.
+
+```bash
+python rebuild.py --discard-backup  # delete the old viewer index only after successful validation/switch
+```
+
+If source files were deliberately removed, inspect missing sessions before using
+`--allow-missing`. Rebuilding from current sources cannot recover deleted source
+history; do not discard a backup that is your only copy.
+
+## Storage and search
+
+- Raw records and normalized messages use versioned, lossless JSON blobs with
+  zlib compression; decoding is transparent to the API.
+- Identical search text is stored/indexed once, with separate message/session
+  associations. This is **storage deduplication**, not deletion/merging of
+  repeated questions, turns, forks or sessions.
+- FTS5 trigram uses `detail=none, columnsize=0` to avoid positional-posting bloat.
+  Queries select candidates by three-character grams and verify the exact literal
+  substring. Short queries/SQLite builds without trigram fall back to literal LIKE.
+- Binary attachments, Base64 data, opaque reasoning/signatures and embedded data
+  URIs are retained in raw records, but replaced by explicit references/markers in
+  normalized content and excluded from search. Structured JSON embedded in tool
+  output is inspected for typed binary/opaque fields as well.
+- VS Code result metadata is summarized (status, timing, usage, error). Tool output
+  is extracted once into tool-result records, paired only by stable call IDs.
+  Unpaired outputs remain separate and explicitly marked; the full original
+  metadata/rounds/rendered context stays in the raw archive.
+- Changed projections are parsed/replayed once and spooled in a private,
+  compressed, per-job cache. Only authenticated cache bytes produced by that
+  job are deserialized; the cache is removed on completion/failure.
+
 ## Supported sources
 
 | Source | Default location | Notes |
 | --- | --- | --- |
 | Claude Code | `~/.claude/projects/**/*.jsonl` | Main sessions and separate agent/subagent transcripts |
-| Codex | `$CODEX_HOME/{sessions,archived_sessions}/**/*.jsonl` (`~/.codex` by default) | Legacy and paginated rollouts; root and child thread identities remain distinct |
+| Codex | `$CODEX_HOME/{sessions,archived_sessions}/**/*.jsonl` (`~/.codex` by default) | Legacy/paginated rollouts; explicit thread/turn ownership preserves historical subagent work even before migrated context boundaries |
 | Copilot CLI | `~/.copilot/session-state/**/events.jsonl` and legacy flat JSONL | Conversation and tool lifecycle events; model snapshots are not duplicated as chat |
 | pi | `~/.pi/agent/sessions/**/*.jsonl` | v1–v3, typed content, tree parent IDs and saved-branch view |
 | VS Code Chat | Platform `Code/User` and `Code - Insiders/User` | Workspace JSON/JSONL and global empty-window sessions; official mutation-log replay |
@@ -85,8 +131,8 @@ archive schemas are refused instead of migrated.
   system filters to inspect other records. A message containing text and tools
   retains both instead of losing one content type.
 - Cross-session search covers names, projects and extracted message/tool text.
-  FTS5 trigram substring search is used when SQLite supports it; short queries
-  and installations without that tokenizer use escaped literal `LIKE`, including
+  Position-free FTS5 trigram substring search is used when SQLite supports it;
+  short queries and installations without that tokenizer use escaped literal `LIKE`, including
   two-character Chinese queries.
 - Messages load **200 records per page**. Use **Load next 200 records** to load
   more. The in-conversation search explicitly searches **loaded messages only**.
@@ -100,8 +146,10 @@ archive schemas are refused instead of migrated.
 This is the first multi-source implementation, not a complete replacement for
 all agents' native history tools:
 
-- Original records are retained, but some source-specific rich blocks display as
-  structured JSON. Images are not rendered and opaque reasoning is not decrypted.
+- Original records are retained losslessly, but some source-specific rich blocks
+  display as structured JSON. Images are not rendered and opaque reasoning is not
+  decrypted/indexed. Large VS Code status/error fields are summarized in the UI;
+  their complete originals remain in raw records.
 - Codex `history_base` inherited prefixes are **not expanded**. Such sessions
   show a warning. Paginated completed items are preferred for visible messages;
   raw response/context records remain accessible in the raw-record API. An
@@ -118,10 +166,11 @@ all agents' native history tools:
   branch pickers for arbitrary pi leaves, watcher/SSE and export are follow-ups.
 - Synchronization runs automatically before startup and on Reload, not through a
   continuous watcher. Per-file content hashes detect rewrites, including
-  equal-size/equal-mtime edits. A first import parses candidates and then imports
-  winners, trading initial scan time for bounded memory and duplicate handling.
-- Index/schema version 1 is independent of the old Claude-only database; a future
-  schema upgrade must use an explicit migration rather than silently overwriting.
+  equal-size/equal-mtime edits. A first import captures candidate projections,
+  then imports winners from the private spool without replaying them a second time.
+- Schema v2 is independent of the old Claude-only database. V1 viewer archives
+  require explicit rebuilding; future schema changes likewise must not silently
+  overwrite existing archives.
 
 ## API
 
