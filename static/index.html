@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Claude Conversation Viewer</title>
+    <title>Agent History Viewer</title>
     <link rel="stylesheet" href="static/css/style.css">
 </head>
 <body>
@@ -11,16 +11,22 @@
         <!-- Left Panel: Session List -->
         <div class="panel left-panel">
             <div class="panel-header">
-                <h2>Sessions</h2>
+                <h2>Agent History · Read-only</h2>
                 <button id="reloadBtn">Reload</button>
             </div>
             <div class="filter-bar" id="sessionFilterBar">
+                <label class="filter-label" for="sourceSelect">Source:</label>
+                <select id="sourceSelect"><option value="">All sources</option></select>
+                <label class="filter-label" for="projectSelect">Project:</label>
+                <select id="projectSelect"><option value="">All projects</option></select>
                 <div class="filter-label">Search:</div>
                 <div class="uuid-search">
                     <input type="text" id="sessionSearch" placeholder="Search sessions (press Enter)..." />
                     <button id="clearSessionSearchBtn" class="clear-btn" title="Clear search">×</button>
                 </div>
             </div>
+            <div class="sync-status" id="syncStatus" role="status">Local history only. Click Reload to import.</div>
+            <details id="syncIssues" class="sync-status" hidden><summary>Sync issues</summary><pre id="syncIssueText"></pre></details>
             <div class="panel-content">
                 <div id="sessionList" class="session-list">
                     <div class="loading">Loading sessions...</div>
@@ -34,15 +40,20 @@
         <!-- Middle Panel: Conversation History -->
         <div class="panel middle-panel">
             <div class="panel-header">
-                <h2>Conversation</h2>
+                <h2 id="conversationTitle">Conversation</h2>
+                <span id="loadedCount" class="message-count"></span>
             </div>
+            <div id="sessionWarnings" class="sync-status" role="status"></div>
             <div class="filter-bar" id="filterBar">
+                <select id="branchSelect" disabled aria-label="Conversation branch">
+                    <option value="">All records</option><option value="active">Current saved branch</option>
+                </select>
                 <div class="filter-label">Filter:</div>
                 <div class="filter-tags" id="filterTags">
                     <!-- Filter tags will be dynamically added here -->
                 </div>
                 <div class="uuid-search">
-                    <input type="text" id="uuidSearch" placeholder="Search messages (press Enter)..." />
+                    <input type="text" id="uuidSearch" placeholder="Search loaded messages (Enter)..." />
                     <button id="clearUuidBtn" class="clear-btn" title="Clear search">×</button>
                 </div>
             </div>
@@ -53,6 +64,7 @@
                     </div>
                 </div>
             </div>
+            <button id="loadMoreBtn" class="load-more" hidden>Load next 200 records</button>
         </div>
 
         <!-- Resizer between middle and right -->
@@ -73,22 +85,6 @@
         </div>
     </div>
 
-    <script>
-        // Global function for wrap toggle
-        function toggleWrap(event) {
-            const button = event.target;
-            const contentBlock = button.closest('.content-block');
-            const preElement = contentBlock.querySelector('.content-text');
-
-            if (preElement.classList.contains('no-wrap')) {
-                preElement.classList.remove('no-wrap');
-                button.classList.remove('active');
-            } else {
-                preElement.classList.add('no-wrap');
-                button.classList.add('active');
-            }
-        }
-    </script>
     <script src="static/js/app.js" type="module"></script>
 </body>
 </html>

@@ -1,93 +1,48 @@
 import { formatTimestampNumeric, escapeHtml } from './utils.js';
 
+const LABELS = { claude: 'Claude Code', codex: 'Codex', copilot_cli: 'Copilot CLI', pi: 'pi', vscode_chat: 'VS Code Chat' };
+
 export class SessionListView {
     constructor(containerId) {
         this.container = document.getElementById(containerId);
         this.sessions = [];
+        this.selectedId = null;
         this.onSessionSelect = null;
-        this.onSessionDelete = null;
+        this.container.addEventListener('click', event => {
+            const item = event.target.closest('.session-item');
+            if (!item) return;
+            this.selectSessionUI(item.dataset.sessionId);
+            this.onSessionSelect?.(item.dataset.sessionId);
+        });
     }
 
     render(sessions) {
         this.sessions = sessions;
-
-        if (!sessions || sessions.length === 0) {
-            this.container.innerHTML = '<div class="empty-state"><p>No sessions found</p></div>';
-            return;
-        }
-
-        this.container.innerHTML = sessions.map(session => this.renderSessionItem(session)).join('');
-        this.attachEventListeners();
+        this.container.innerHTML = sessions.length ? sessions.map(session => this.renderSessionItem(session)).join('')
+            : '<div class="empty-state"><p>No sessions found. Click Reload to import local history.</p></div>';
+        this.selectSessionUI(this.selectedId);
     }
 
     renderSessionItem(session) {
-        const uuid = session.id;
-        const formattedProject = session.project.replace(/--/g, ':/').replace(/-/g, '/');
-
-        return `
-            <div class="session-item" data-session-id="${escapeHtml(session.id)}">
-                <div class="session-header">
-                    <div class="session-project" title="Project: ${escapeHtml(formattedProject)}">
-                        ${escapeHtml(formattedProject)}
-                    </div>
-                    <div class="message-count">${session.messageCount || 0} messages</div>
-                </div>
-                <div class="session-uuid" title="${escapeHtml(uuid)}">
-                    ${escapeHtml(uuid)}
-                </div>
-                <div class="session-footer">
-                    <div class="session-time">${formatTimestampNumeric(session.lastModified)}</div>
-                    <button class="session-delete-btn" data-session-id="${escapeHtml(session.id)}" title="Delete session">×</button>
-                </div>
+        return `<div class="session-item" data-session-id="${escapeHtml(session.id)}">
+            <div class="session-header">
+                <span class="source-badge">${escapeHtml(LABELS[session.source] || session.source)}${session.metadata?.relationship ? ` · ${escapeHtml(session.metadata.relationship)}` : ''}</span>
+                <span class="message-count">${session.messageCount} records</span>
             </div>
-        `;
-    }
-
-    attachEventListeners() {
-        const items = this.container.querySelectorAll('.session-item');
-        items.forEach(item => {
-            // Click on session item to select
-            item.addEventListener('click', (e) => {
-                // Don't trigger if clicking delete button
-                if (e.target.classList.contains('session-delete-btn')) {
-                    return;
-                }
-                this.selectSession(item.dataset.sessionId);
-            });
-        });
-
-        // Delete button listeners
-        const deleteButtons = this.container.querySelectorAll('.session-delete-btn');
-        deleteButtons.forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation(); // Prevent session selection
-                const sessionId = btn.dataset.sessionId;
-                if (this.onSessionDelete) {
-                    this.onSessionDelete(sessionId);
-                }
-            });
-        });
-    }
-
-    selectSession(sessionId) {
-        // Update UI
-        this.selectSessionUI(sessionId);
-
-        // Trigger callback
-        if (this.onSessionSelect) {
-            this.onSessionSelect(sessionId);
-        }
+            <div class="session-name" title="${escapeHtml(session.name)}">${escapeHtml(session.name)}</div>
+            <div class="session-project" title="${escapeHtml(session.project)}">${escapeHtml(session.project || '(no workspace)')}</div>
+            <div class="session-uuid" title="${escapeHtml(session.id)}">${escapeHtml(session.externalId)}</div>
+            <div class="session-footer">
+                <div class="session-time">${escapeHtml(formatTimestampNumeric(session.lastModified, session.timestampUnit))}</div>
+                <span class="archive-state">${session.available ? 'Read-only' : 'Archived · source missing'}</span>
+            </div>
+        </div>`;
     }
 
     selectSessionUI(sessionId) {
-        // Update UI only, without triggering callback
-        const items = this.container.querySelectorAll('.session-item');
-        items.forEach(item => {
-            if (item.dataset.sessionId === sessionId) {
-                item.classList.add('active');
-            } else {
-                item.classList.remove('active');
-            }
+        this.selectedId = sessionId;
+        this.container.querySelectorAll('.session-item').forEach(item => {
+            item.classList.toggle('active', item.dataset.sessionId === sessionId);
         });
     }
 }

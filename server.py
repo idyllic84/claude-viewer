@@ -1,141 +1,156 @@
-"""
-Flask server for Claude Viewer
-HTTP API layer
-"""
-
-import json
-import sys
-import signal
+"""Loopback-only HTTP API for the read-only multi-agent history archive."""
+import argparse
+import os
 from pathlib import Path
-from flask import Flask, jsonify, send_from_directory, request
+from urllib.parse import urlsplit
+from flask import Flask, jsonify, request, send_from_directory
 from flask_compress import Compress
-
-from service import ClaudeViewerService
+from werkzeug.exceptions import HTTPException
+from service import ClaudeViewerService, SyncBusy
 
 BASE_DIR = Path(__file__).parent
 
-app = Flask(__name__,
-            static_folder=str(BASE_DIR / 'static'),
-            static_url_path='/static')
 
-Compress(app)
+def create_app(viewer_service=None):
+    app = Flask(__name__, static_folder=str(BASE_DIR / 'static'), static_url_path='/static')
+    Compress(app)
+    service = viewer_service or ClaudeViewerService()
+    service.initialize()
+    app.config['VIEWER_SERVICE'] = service
+    allowed_hosts = {'localhost', '127.0.0.1', '::1'}
+    allowed_hosts.update(h.strip().lower() for h in os.environ.get('VIEWER_ALLOWED_HOSTS', '').split(',') if h.strip())
 
-service = ClaudeViewerService()
+    @app.before_request
+    def protect_local_api():
+        host = urlsplit('//' + request.host).hostname
+        if not host or host.lower() not in allowed_hosts:
+            return jsonify(error='Untrusted Host header'), 403
+        if request.method in ('POST', 'DELETE', 'PUT', 'PATCH'):
+            if request.headers.get('X-Viewer-Request') != '1':
+                return jsonify(error='Missing X-Viewer-Request header'), 403
+            origin = request.headers.get('Origin')
+            if origin and origin != request.host_url.rstrip('/'):
+                return jsonify(error='Cross-origin mutation is not allowed'), 403
 
-ERROR_STATUS_MAP = {
-    'invalid_input': 400,
-    'not_found': 404,
-    'server_error': 500
-}
+    @app.after_request
+    def security_headers(response):
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        if response.is_json:
+            response.headers['Cache-Control'] = 'no-store'
+        return response
 
+    @app.errorhandler(Exception)
+    def handle_exception(exc):
+        if isinstance(exc, HTTPException):
+            return jsonify(error=exc.description), exc.code
+        if isinstance(exc, SyncBusy):
+            return jsonify(error=str(exc)), 409
+        if isinstance(exc, ValueError):
+            return jsonify(error=str(exc)), 400
+        app.logger.exception('Viewer request failed')
+        return jsonify(error='Archive operation failed; see server log'), 500
 
-def handle_service_error(result):
-    if result.get('error'):
-        error_type = result.get('error_type', 'server_error')
-        status_code = ERROR_STATUS_MAP.get(error_type, 500)
-        return jsonify({'error': result['error']}), status_code
-    return None
+    def page(default=200):
+        offset = int(request.args.get('cursor', '0'))
+        limit = int(request.args.get('limit', str(default)))
+        if offset < 0 or not 1 <= limit <= 500:
+            raise ValueError('cursor must be nonnegative and limit must be between 1 and 500')
+        return offset, limit
 
+    def found(result):
+        return (jsonify(error='Not found'), 404) if result is None else jsonify(result)
 
-@app.errorhandler(Exception)
-def handle_exception(e):
-    return jsonify({'error': str(e)}), 500
+    @app.get('/')
+    def index():
+        return send_from_directory(BASE_DIR / 'static', 'index.html')
 
+    @app.get('/favicon.ico')
+    def favicon():
+        return send_from_directory(BASE_DIR / 'static', 'favicon.ico')
 
-@app.route('/')
-def index():
-    return send_from_directory(BASE_DIR / 'static', 'index.html')
+    @app.get('/api/sources')
+    def sources():
+        return jsonify(service.get_sources())
 
+    @app.get('/api/sessions')
+    def sessions_page():
+        offset, limit = page(100)
+        items, total = service.list_sessions(project=request.args.get('project'), source=request.args.get('source'),
+                                             query=request.args.get('q', '').strip(), offset=offset, limit=limit)
+        return jsonify(items=items, total=total, nextCursor=offset + len(items) if offset + len(items) < total else None)
 
-@app.route('/favicon.ico')
-def favicon():
-    return send_from_directory(BASE_DIR / 'static', 'favicon.ico')
+    @app.get('/sessions')
+    def sessions_legacy():
+        return jsonify(service.get_all_sessions(request.args.get('project'), request.args.get('source')))
 
+    @app.get('/sessions/search')
+    def search_legacy():
+        return jsonify(service.search_sessions_by_content(request.args.get('q', '').strip(), request.args.get('source')))
 
-@app.route('/sessions')
-def get_sessions():
-    project_filter = request.args.get('project')
-    sessions = service.get_all_sessions(project_filter)
-    return jsonify(sessions)
+    @app.post('/api/sync')
+    @app.post('/sessions/sync')
+    def sync():
+        return jsonify(service.sync_sessions())
 
+    @app.post('/api/sync/start')
+    def start_sync():
+        return jsonify(service.start_sync()), 202
 
-@app.route('/sessions/search')
-def search_sessions():
-    """Search sessions by message content"""
-    search_term = request.args.get('q', '')
+    @app.get('/api/sync/status')
+    def sync_status():
+        return jsonify(service.sync_status())
 
-    # If empty search, return all sessions directly (no DB search needed)
-    if not search_term or search_term.strip() == '':
-        sessions = service.get_all_sessions()
-    else:
-        sessions = service.search_sessions_by_content(search_term)
+    @app.get('/api/sessions/<path:session_id>/messages')
+    def messages_page(session_id):
+        offset, limit = page()
+        return found(service.get_messages(session_id, offset=offset, limit=limit, branch=request.args.get('branch')))
 
-    return jsonify(sessions)
+    @app.get('/session/<path:session_id>')
+    def messages_legacy(session_id):
+        result = service.get_messages(session_id, limit=500)
+        if result is None:
+            return found(None)
+        # Legacy endpoint is bounded. New clients use cursor-based /api/.../messages.
+        return jsonify(result['items'])
 
+    @app.delete('/session/<path:session_id>')
+    def source_delete_disabled(session_id):
+        return jsonify(error='Source deletion is disabled. This viewer only reads agent history.'), 405
 
-@app.route('/sessions/sync', methods=['POST'])
-def sync_sessions_endpoint():
-    sessions = service.sync_sessions_from_claude_files()
-    return jsonify(sessions)
+    @app.get('/api/messages/<path:message_id>/raw')
+    def raw_message(message_id):
+        return found(service.get_raw_message(message_id))
 
+    @app.get('/api/sessions/<path:session_id>/records')
+    def records(session_id):
+        offset, limit = page(50)
+        return found(service.get_records(session_id, offset=offset, limit=limit))
 
-@app.route('/session/<session_id>')
-def get_session_messages(session_id):
-    result = service.get_session_with_messages(session_id)
-
-    error_response = handle_service_error(result)
-    if error_response:
-        return error_response
-
-    messages = [json.loads(row['raw_json']) for row in result['messages']]
-    return jsonify(messages)
-
-
-@app.route('/session/<session_id>', methods=['DELETE'])
-def delete_session(session_id):
-    result = service.delete_session(session_id)
-
-    if result['success']:
-        return jsonify({
-            'success': True,
-            'deleted': result['deleted']
-        }), 200
-    else:
-        return jsonify({
-            'success': False,
-            'deleted': result['deleted'],
-            'errors': result['errors']
-        }), 500
-
-
-def shutdown_handler(signum, frame):
-    print(f"\nReceived signal {signum}, shutting down gracefully...")
-    service.shutdown()
-    sys.exit(0)
+    return app
 
 
 if __name__ == '__main__':
-    debug_mode = '--debug' in sys.argv
-
-    print(f"Claude Viewer Server")
-
-    service.initialize()
-
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-
-    print(f"Starting server on http://localhost:8000")
-    print(f"Press Ctrl+C to stop")
-
-    if not debug_mode:
-        print(f"\nNote: Running in production mode. Use --debug for development mode.")
-
+    parser = argparse.ArgumentParser(description='Local read-only agent history viewer')
+    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--no-sync', action='store_true', help='Skip the default startup sync')
+    parser.add_argument('--sync', action='store_true', help=argparse.SUPPRESS)  # Old explicit flag remains valid.
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error('--port must be between 1 and 65535')
+    app = create_app()
+    service = app.config['VIEWER_SERVICE']
+    if not args.no_sync:
+        print('Syncing configured history sources before startup (read-only)...', flush=True)
+        service.sync_sessions()
+    print(f'Agent History Viewer: http://localhost:{args.port}\nArchive: {service._db.db_path}', flush=True)
+    print(('Startup sync skipped (--no-sync).' if args.no_sync else 'Startup sync completed.') +
+          ' Original files and claude.db are never modified.', flush=True)
     try:
-        app.run(
-            host='localhost',
-            port=8000,
-            debug=debug_mode,
-            use_reloader=debug_mode
-        )
+        app.run(host='localhost', port=args.port, debug=args.debug, use_reloader=False)
     finally:
         service.shutdown()

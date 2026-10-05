@@ -299,6 +299,30 @@ button:active {
     font-size: 11px;
 }
 
+[hidden] { display: none !important; }
+
+select {
+    max-width: 100%;
+    padding: 6px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+}
+
+button:disabled { opacity: 0.5; cursor: default; }
+.panel-header h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#sessionFilterBar .uuid-search { width: 100%; }
+#sessionWarnings:empty { display: none; }
+.sync-status { padding: 8px 12px; font-size: 11px; color: var(--text-secondary); }
+#syncIssues { max-height: 200px; overflow: auto; }
+#syncIssueText { white-space: pre-wrap; overflow-wrap: anywhere; }
+.source-badge { color: var(--assistant-color); font-size: 11px; font-weight: 600; }
+.session-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-state { font-size: 10px; color: var(--text-secondary); }
+.detail-note { color: var(--text-secondary); font-size: 11px; margin-bottom: 8px; }
+.load-more { margin: 8px 16px; }
+
 /* Session List */
 .session-list {
     padding: 8px;

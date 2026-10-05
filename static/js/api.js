@@ -1,75 +1,48 @@
-// API endpoint configuration - use empty string for relative paths
-const API_BASE_URL = '';
-
-export async function fetchSessions(projectFilter = null) {
-    try {
-        const url = projectFilter
-            ? `${API_BASE_URL}/sessions?project=${encodeURIComponent(projectFilter)}`
-            : `${API_BASE_URL}/sessions`;
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        return await response.json();
-    } catch (error) {
-        console.error('Error fetching sessions:', error);
-        throw error;
+async function requestJson(path, options = {}) {
+    const response = await fetch(path, options);
+    if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.error || `HTTP ${response.status}`);
     }
+    return response.json();
 }
 
-export async function searchSessions(searchTerm = '') {
-    try {
-        const url = `${API_BASE_URL}/sessions/search?q=${encodeURIComponent(searchTerm)}`;
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        return await response.json();
-    } catch (error) {
-        console.error('Error searching sessions:', error);
-        throw error;
-    }
+export function fetchSources() {
+    return requestJson('/api/sources');
 }
 
-export async function syncSessions() {
-    try {
-        const response = await fetch(`${API_BASE_URL}/sessions/sync`, {
-            method: 'POST'
-        });
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        return await response.json();
-    } catch (error) {
-        console.error('Error syncing sessions:', error);
-        throw error;
-    }
+export async function fetchSessions(source = '', query = '') {
+    const sessions = [];
+    let cursor = 0;
+    do {
+        const params = new URLSearchParams({ source, q: query, cursor, limit: 500 });
+        const page = await requestJson(`/api/sessions?${params}`);
+        sessions.push(...page.items);
+        cursor = page.nextCursor;
+    } while (cursor !== null);
+    return sessions;
 }
 
-export async function fetchSessionMessages(sessionPath) {
-    try {
-        const response = await fetch(`${API_BASE_URL}/session/${sessionPath}`);
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        return await response.json();
-    } catch (error) {
-        console.error('Error fetching session messages:', error);
-        throw error;
-    }
+export function syncSessions() {
+    return requestJson('/api/sync/start', { method: 'POST', headers: { 'X-Viewer-Request': '1' } });
 }
 
-export async function deleteSession(sessionPath) {
-    try {
-        const response = await fetch(`${API_BASE_URL}/session/${sessionPath}`, {
-            method: 'DELETE'
-        });
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        return await response.json();
-    } catch (error) {
-        console.error('Error deleting session:', error);
-        throw error;
+export async function fetchSyncStatus() {
+    const status = await requestJson('/api/sync/status');
+    // Attach to an in-flight job from the previous server version without restarting it.
+    if (status.running && !status.progress) {
+        const page = await requestJson('/api/sessions?limit=1');
+        status.indexedSessions = page.total;
     }
+    return status;
+}
+
+export function fetchSessionMessages(sessionId, cursor = 0, branch = '') {
+    const params = new URLSearchParams({ cursor, limit: 200 });
+    if (branch) params.set('branch', branch);
+    return requestJson(`/api/sessions/${encodeURIComponent(sessionId)}/messages?${params}`);
+}
+
+export function fetchRawMessage(messageId) {
+    return requestJson(`/api/messages/${encodeURIComponent(messageId)}/raw`);
 }

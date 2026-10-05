@@ -25,15 +25,18 @@ export class ConversationView {
             return;
         }
 
+        const scrollParent = this.container.parentElement;
+        const scrollTop = scrollParent.scrollTop;
         this.container.innerHTML = this.filteredMessages.map((msg, index) => this.renderMessage(msg, index)).join('');
         this.attachEventListeners();
+        scrollParent.scrollTop = scrollTop;
     }
 
     renderMessage(message, index) {
         const typeClass = getMessageTypeClass(message);
         const typeName = getMessageTypeName(message);
-        const timestamp = formatTime(message.timestamp);
-        const orderId = `#${index}`;
+        const timestamp = formatTime(message.timestamp, message.timestampUnit);
+        const orderId = `#${message.orderId ?? index}`;
         const uuid = message.uuid ? message.uuid.substring(0, 8) : 'N/A';
 
         // Get preview based on message type
@@ -41,8 +44,8 @@ export class ConversationView {
         const type = message.type;
 
         if (type === 'summary') {
-            preview = message.summary || '';
-        } else if (type === 'user' || type === 'assistant') {
+            preview = message.summary || extractMessagePreview(message.message) || '';
+        } else if (message.message) {
             if (message.message) {
                 preview = extractMessagePreview(message.message);
             }

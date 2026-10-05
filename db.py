@@ -1,26 +1,29 @@
-"""
-Database operations for Claude Viewer
-Handles SQLite database management for sessions and messages
-"""
-
+"""Viewer-owned SQLite archive. Never opens or migrates an agent's database."""
+from contextlib import contextmanager
 import json
-import sqlite3
 import os
 from pathlib import Path
-from contextlib import contextmanager
+import sqlite3
+from models import searchable_text
+
+SCHEMA_VERSION = 1
+ARCHIVE_APPLICATION_ID = 0x43565732  # CVW2: reject accidental agent/foreign database paths.
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
 class Database:
-    """Database manager for Claude Viewer"""
-
-    def __init__(self):
-        db_dir = Path(__file__).parent
-        self.db_path = db_dir / 'claude.db'
+    def __init__(self, db_path=None):
+        self.db_path = Path(db_path or os.environ.get('VIEWER_DB') or Path(__file__).parent / 'viewer.db')
+        if self.db_path.resolve() == (Path(__file__).parent / 'claude.db').resolve():
+            raise ValueError('The legacy claude.db is preserved; choose a separate VIEWER_DB')
+        self.has_trigram = False
 
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA foreign_keys = ON')
         try:
@@ -33,232 +36,209 @@ class Database:
             conn.close()
 
     def init_schema(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-
-            cursor.execute('PRAGMA foreign_keys = ON')
-
-            cursor.execute('''
+            version = conn.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0, SCHEMA_VERSION):
+                raise ValueError(f'Unsupported archive schema version: {version}')
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            application_id = conn.execute('PRAGMA application_id').fetchone()[0]
+            if (tables and application_id != ARCHIVE_APPLICATION_ID) or (
+                    not tables and application_id not in (0, ARCHIVE_APPLICATION_ID)):
+                raise ValueError('Not a viewer-owned archive; existing databases will not be modified')
+            conn.execute(f'PRAGMA application_id = {ARCHIVE_APPLICATION_ID}')
+            conn.execute('PRAGMA journal_mode = WAL')
+            conn.executescript('''
                 CREATE TABLE IF NOT EXISTS sessions (
-                    id TEXT PRIMARY KEY,
-                    project TEXT NOT NULL,
-                    message_count INTEGER NOT NULL,
-                    last_update_time INTEGER NOT NULL
-                )
-            ''')
-
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_last_update_time ON sessions(last_update_time DESC)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_project ON sessions(project)')
-
-            cursor.execute('''
+                    id TEXT PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL,
+                    project TEXT NOT NULL, name TEXT NOT NULL, message_count INTEGER NOT NULL,
+                    last_modified INTEGER NOT NULL, path TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    parser_version INTEGER NOT NULL, metadata TEXT NOT NULL, warnings TEXT NOT NULL,
+                    available INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS sessions_modified ON sessions(last_modified DESC, id);
+                CREATE INDEX IF NOT EXISTS sessions_source_project ON sessions(source, project);
+                CREATE TABLE IF NOT EXISTS raw_records (
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    record_index INTEGER NOT NULL, raw_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, record_index)
+                );
                 CREATE TABLE IF NOT EXISTS messages (
-                    session_id TEXT NOT NULL,
-                    order_id INTEGER NOT NULL,
-                    timestamp INTEGER,
-                    type TEXT,
-                    raw_json TEXT NOT NULL,
-                    PRIMARY KEY (session_id, order_id),
-                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-                )
+                    id TEXT NOT NULL UNIQUE, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    order_id INTEGER NOT NULL, native_id TEXT, parent_id TEXT,
+                    raw_record INTEGER NOT NULL, normalized_json TEXT NOT NULL, search_text TEXT NOT NULL,
+                    PRIMARY KEY (session_id, order_id)
+                );
+                CREATE TABLE IF NOT EXISTS source_files (
+                    path TEXT PRIMARY KEY, source TEXT NOT NULL, session_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL, parser_version INTEGER NOT NULL,
+                    modified INTEGER NOT NULL, message_count INTEGER NOT NULL,
+                    available INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS source_files_session ON source_files(session_id);
             ''')
+            # Trigram preserves substring semantics, including CJK. Short queries use literal LIKE.
+            try:
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS message_search USING fts5(search_text, content='messages', content_rowid='rowid', tokenize='trigram')")
+                new_index = not conn.execute("SELECT 1 FROM sqlite_master WHERE name='messages_search_insert'").fetchone()
+                conn.executescript('''
+                    CREATE TRIGGER IF NOT EXISTS messages_search_insert AFTER INSERT ON messages BEGIN
+                        INSERT INTO message_search(rowid, search_text) VALUES (new.rowid, new.search_text);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS messages_search_delete AFTER DELETE ON messages BEGIN
+                        INSERT INTO message_search(message_search, rowid, search_text)
+                        VALUES ('delete', old.rowid, old.search_text);
+                    END;
+                ''')
+                if new_index:
+                    conn.execute("INSERT INTO message_search(message_search) VALUES ('rebuild')")
+                self.has_trigram = True
+            except sqlite3.OperationalError:
+                self.has_trigram = False
+            conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
 
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_messages_session_type ON messages(session_id, type)')
-
-    def get_all_sessions(self, project_filter=None):
+    def file_states(self):
         with self.get_connection() as conn:
-            cursor = conn.cursor()
+            return {r['path']: dict(r) for r in conn.execute('SELECT * FROM source_files')}
 
-            if project_filter:
-                cursor.execute('''
-                    SELECT id, project, message_count, last_update_time
-                    FROM sessions
-                    WHERE project = ?
-                    ORDER BY last_update_time DESC
-                ''', (project_filter,))
+    def replace_session(self, document, path, fingerprint, modified, parser_version, files):
+        """Projection, raw records, file watermarks and FTS change in ONE transaction."""
+        with self.get_connection() as conn:
+            conn.execute('''INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(id) DO UPDATE SET project=excluded.project, name=excluded.name,
+                message_count=excluded.message_count, last_modified=excluded.last_modified,
+                path=excluded.path, fingerprint=excluded.fingerprint, parser_version=excluded.parser_version,
+                metadata=excluded.metadata, warnings=excluded.warnings, available=1''',
+                (document.id, document.source, document.external_id, document.project, document.name,
+                 len(document.messages), modified, str(path), fingerprint, parser_version,
+                 encode(document.metadata), encode(document.warnings)))
+            conn.execute('DELETE FROM messages WHERE session_id=?', (document.id,))
+            conn.execute('DELETE FROM raw_records WHERE session_id=?', (document.id,))
+            conn.executemany('INSERT INTO raw_records VALUES (?, ?, ?)',
+                             ((document.id, i, encode(r)) for i, r in document.records))
+            conn.executemany('INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                ((m['id'], document.id, order, m['uuid'], m.get('parentUuid'), m['rawRecord'], encode(m),
+                  searchable_text(m['message']['content'])) for order, m in enumerate(document.messages)))
+            self._store_files(conn, files)
+
+    @staticmethod
+    def _store_files(conn, files):
+        conn.executemany('''INSERT INTO source_files VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(path) DO UPDATE SET session_id=excluded.session_id, fingerprint=excluded.fingerprint,
+            parser_version=excluded.parser_version, modified=excluded.modified,
+            message_count=excluded.message_count, available=1''', files)
+
+    def update_files(self, files):
+        with self.get_connection() as conn:
+            self._store_files(conn, files)
+            for f in files:
+                conn.execute('UPDATE sessions SET available=1 WHERE id=?', (f[2],))
+
+    def mark_missing(self, paths):
+        with self.get_connection() as conn:
+            conn.executemany('UPDATE source_files SET available=0 WHERE path=?', ((p,) for p in paths))
+            conn.execute('''UPDATE sessions SET available=CASE WHEN EXISTS
+                (SELECT 1 FROM source_files f WHERE f.session_id=sessions.id
+                 AND f.path=sessions.path AND f.available=1) THEN 1 ELSE 0 END''')
+
+    @staticmethod
+    def _session(row):
+        return {'id': row['id'], 'source': row['source'], 'externalId': row['external_id'],
+                'project': row['project'], 'name': row['name'], 'messageCount': row['message_count'],
+                'lastModified': row['last_modified'], 'timestampUnit': 'ms', 'available': bool(row['available']),
+                'metadata': json.loads(row['metadata']), 'warnings': json.loads(row['warnings']),
+                'capabilities': {'readOnly': True, 'sourceDelete': False}}
+
+    def get_session(self, session_id):
+        with self.get_connection() as conn:
+            row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
+            return self._session(row) if row else None
+
+    def list_sessions(self, project=None, source=None, query='', offset=0, limit=None):
+        clauses, params = [], []
+        if project:
+            clauses.append('s.project=?'); params.append(project)
+        if source:
+            clauses.append('s.source=?'); params.append(source)
+        if query:
+            pattern = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+            if self.has_trigram and len(query) >= 3:
+                match = '"' + query.replace('"', '""') + '"'
+                message_clause = '''s.id IN (SELECT m.session_id FROM message_search f
+                    JOIN messages m ON m.rowid=f.rowid WHERE message_search MATCH ?
+                    AND m.search_text LIKE ? ESCAPE '\\')'''
+                message_params = [match, pattern]
             else:
-                cursor.execute('''
-                    SELECT id, project, message_count, last_update_time
-                    FROM sessions
-                    ORDER BY last_update_time DESC
-                ''')
+                message_clause = "s.id IN (SELECT session_id FROM messages WHERE search_text LIKE ? ESCAPE '\\')"
+                message_params = [pattern]
+            clauses.append(f"({message_clause} OR s.name LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\' OR s.external_id LIKE ? ESCAPE '\\')")
+            params.extend(message_params + [pattern, pattern, pattern])
+        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        with self.get_connection() as conn:
+            total = conn.execute('SELECT COUNT(*) FROM sessions s' + where, params).fetchone()[0]
+            sql = 'SELECT s.* FROM sessions s' + where + ' ORDER BY s.last_modified DESC, s.id'
+            if limit is not None:
+                sql += ' LIMIT ? OFFSET ?'; params.extend([limit, offset])
+            rows = conn.execute(sql, params).fetchall()
+            return [self._session(r) for r in rows], total
 
-            rows = cursor.fetchall()
-
-            sessions = []
-            for row in rows:
-                sessions.append({
-                    'id': row['id'],
-                    'project': row['project'],
-                    'messageCount': row['message_count'],
-                    'lastModified': row['last_update_time']
-                })
-
-            return sessions
-
-    def get_messages_by_session(self, session_id):
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT session_id, order_id, timestamp, type, raw_json
-                    FROM messages
-                    WHERE session_id = ?
-                    ORDER BY order_id ASC
-                ''', (session_id,))
-
-                return cursor.fetchall()
-        except Exception as e:
-            print(f"Error getting messages for session {session_id}: {e}")
-            return []
-
-    def upsert_session(self, session_id, project, message_count, last_update_time):
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                # Use INSERT ... ON CONFLICT to avoid triggering CASCADE DELETE
-                cursor.execute('''
-                    INSERT INTO sessions (id, project, message_count, last_update_time)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        project = excluded.project,
-                        message_count = excluded.message_count,
-                        last_update_time = excluded.last_update_time
-                ''', (session_id, project, message_count, last_update_time))
-            return True
-        except Exception as e:
-            print(f"Error upserting session: {e}")
-            return False
-
-    def insert_messages_batch(self, messages_data):
-        session_id = messages_data[0][0] if messages_data else None
-
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.executemany('''
-                    INSERT OR IGNORE INTO messages (session_id, order_id, timestamp, type, raw_json)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', messages_data)
-                inserted_count = cursor.rowcount
-
-            # After commit, query the actual count
-            if session_id:
-                with self.get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute('SELECT COUNT(*) FROM messages WHERE session_id = ?', (session_id,))
-                    total_count = cursor.fetchone()[0]
-                    print(f"Session {session_id[:12]}...: Inserted {inserted_count} messages, total now {total_count}")
-            else:
-                print(f"Inserted {inserted_count} messages (attempted {len(messages_data)})")
-
-            return inserted_count
-        except Exception as e:
-            print(f"Error inserting messages batch: {e}")
-            import traceback
-            traceback.print_exc()
-            return 0
-
-    def delete_session(self, session_id):
-        """Delete a session from database (CASCADE deletes messages)"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
-            return True
-        except Exception as e:
-            print(f"Error deleting session from DB: {e}")
-            return False
-
-    def search_sessions_by_content(self, search_term):
-        """
-        Search for sessions containing the search term in their messages' raw_json.
-        Returns list of unique session IDs.
-
-        Args:
-            search_term: Non-empty string to search for
-
-        Returns:
-            List of session IDs that contain the search term
-        """
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-
-                # Search in raw_json using LIKE (case-insensitive)
-                search_pattern = f'%{search_term}%'
-                cursor.execute('''
-                    SELECT DISTINCT m.session_id
-                    FROM messages m
-                    WHERE m.raw_json LIKE ? COLLATE NOCASE
-                    ORDER BY m.session_id
-                ''', (search_pattern,))
-
-                rows = cursor.fetchall()
-                return [row[0] for row in rows]
-
-        except Exception as e:
-            print(f"Error searching sessions by content: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-
-    def get_actual_message_count(self, session_id):
-        """Get the actual count of messages in the database for a session"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) FROM messages WHERE session_id = ?', (session_id,))
-                return cursor.fetchone()[0]
-        except Exception as e:
-            print(f"Error getting actual message count: {e}")
-            return 0
-
-    def get_max_order_id(self, session_id):
-        """Get the maximum order_id for a session (returns None if no messages)"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT MAX(order_id) FROM messages WHERE session_id = ?', (session_id,))
-                result = cursor.fetchone()[0]
-                return result
-        except Exception as e:
-            print(f"Error getting max order_id: {e}")
+    def get_messages(self, session_id, offset=0, limit=200, branch=None):
+        session = self.get_session(session_id)
+        if session is None:
             return None
+        with self.get_connection() as conn:
+            branch_orders = None
+            if branch:
+                leaf = session['metadata'].get('defaultLeaf') if branch == 'active' else branch
+                if not leaf:
+                    raise ValueError('This session has no branch metadata')
+                nodes = {r['native_id']: r for r in conn.execute(
+                    'SELECT native_id, parent_id, order_id FROM messages WHERE session_id=?', (session_id,))}
+                if leaf not in nodes:
+                    raise ValueError('Unknown branch leaf')
+                seen, branch_orders = set(), []
+                while leaf and leaf not in seen and leaf in nodes:
+                    seen.add(leaf); node = nodes[leaf]
+                    branch_orders.append(node['order_id']); leaf = node['parent_id']
+            if branch_orders is None:
+                rows = conn.execute('''SELECT normalized_json, order_id FROM messages WHERE session_id=?
+                    ORDER BY order_id LIMIT ? OFFSET ?''', (session_id, limit, offset)).fetchall()
+                total = session['messageCount']
+            else:
+                # Avoid SQLite's variable limit for large branches; page the order IDs first.
+                branch_orders.sort(); total = len(branch_orders)
+                selected = branch_orders[offset:offset + limit]
+                rows = [conn.execute('SELECT normalized_json, order_id FROM messages WHERE session_id=? AND order_id=?',
+                                     (session_id, order)).fetchone() for order in selected]
+            items = []
+            for row in rows:
+                message = json.loads(row['normalized_json']); message['orderId'] = row['order_id']
+                items.append(message)
+            return {'items': items, 'total': total, 'session': session,
+                    'nextCursor': offset + len(items) if offset + len(items) < total else None}
 
-    def get_inconsistent_sessions(self):
-        """Find sessions where message_count doesn't match actual message count"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT s.id, s.project, s.message_count,
-                           COUNT(m.session_id) as actual_count,
-                           s.last_update_time
-                    FROM sessions s
-                    LEFT JOIN messages m ON s.id = m.session_id
-                    GROUP BY s.id
-                    HAVING s.message_count != actual_count
-                    ORDER BY s.last_update_time DESC
-                ''')
-                rows = cursor.fetchall()
-                return [{
-                    'id': row[0],
-                    'project': row[1],
-                    'expected_count': row[2],
-                    'actual_count': row[3],
-                    'last_update_time': row[4]
-                } for row in rows]
-        except Exception as e:
-            print(f"Error getting inconsistent sessions: {e}")
-            return []
+    def get_raw_message(self, message_id):
+        with self.get_connection() as conn:
+            row = conn.execute('SELECT * FROM messages WHERE id=?', (message_id,)).fetchone()
+            if row is None:
+                return None
+            normalized = json.loads(row['normalized_json'])
+            indices = [row['raw_record'], *normalized.get('relatedRawRecords', [])]
+            records = []
+            for index in dict.fromkeys(indices):
+                raw = conn.execute('SELECT raw_json FROM raw_records WHERE session_id=? AND record_index=?',
+                                   (row['session_id'], index)).fetchone()
+                if raw:
+                    records.append({'recordIndex': index, 'record': json.loads(raw[0])})
+            path = conn.execute('SELECT path FROM sessions WHERE id=?', (row['session_id'],)).fetchone()[0]
+            return {'sourcePath': path, 'sourceLocator': normalized.get('sourceLocator'), 'records': records}
 
-    def delete_messages(self, session_id):
-        """Delete all messages for a session (without deleting the session itself)"""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
-                return cursor.rowcount
-        except Exception as e:
-            print(f"Error deleting messages for session: {e}")
-            return 0
+    def get_records(self, session_id, offset=0, limit=50):
+        if self.get_session(session_id) is None:
+            return None
+        with self.get_connection() as conn:
+            total = conn.execute('SELECT COUNT(*) FROM raw_records WHERE session_id=?', (session_id,)).fetchone()[0]
+            rows = conn.execute('''SELECT record_index, raw_json FROM raw_records WHERE session_id=?
+                ORDER BY record_index LIMIT ? OFFSET ?''', (session_id, limit, offset)).fetchall()
+            return {'items': [{'recordIndex': r[0], 'record': json.loads(r[1])} for r in rows], 'total': total,
+                    'nextCursor': offset + len(rows) if offset + len(rows) < total else None}

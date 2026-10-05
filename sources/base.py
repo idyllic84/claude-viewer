@@ -1,0 +1,155 @@
+"""Read-only source adapters. No adapter has a source-delete operation."""
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+
+
+class SourceError(ValueError):
+    pass
+
+
+class SnapshotRecords(list):
+    """Parsed records plus the hash of the exact byte prefix that produced them."""
+    def __init__(self, path):
+        super().__init__()
+        self.hasher = hashlib.sha256(str(path).encode('utf-8'))
+        self.byte_count = 0
+        self.modified_ns = None
+        self.dependencies = {}
+
+    @classmethod
+    def from_json(cls, path, value):
+        records = cls(path)
+        records.append((0, value))
+        records.hasher = value.snapshot_hasher
+        records.byte_count = value.snapshot_byte_count
+        records.modified_ns = value.snapshot_modified_ns
+        return records
+
+
+class SnapshotObject(dict):
+    pass
+
+
+@dataclass(frozen=True)
+class SourceFile:
+    path: Path
+    project: str = ''
+    dependencies: tuple = ()
+
+    def fingerprint(self):
+        digest = hashlib.sha256()
+        for path in (self.path, *self.dependencies):
+            digest.update(str(path).encode('utf-8'))
+            if not path.exists():
+                digest.update(b'<missing>')
+                continue
+            before = path.stat()
+            remaining = before.st_size
+            with path.open('rb') as stream:
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise SourceError('File truncated while fingerprinting; retry sync')
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+        return digest.hexdigest()
+
+    def snapshot_fingerprint(self, records):
+        """Allow append after a read, but reject rewrites/truncation of that read's prefix."""
+        if not isinstance(records, SnapshotRecords):
+            raise SourceError('Adapter did not provide snapshot provenance')
+        actual = hashlib.sha256(str(self.path).encode('utf-8'))
+        remaining = records.byte_count
+        with self.path.open('rb') as stream:
+            while remaining:
+                chunk = stream.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise SourceError('Source snapshot was truncated; retry sync')
+                actual.update(chunk)
+                remaining -= len(chunk)
+        if actual.digest() != records.hasher.digest():
+            raise SourceError('Source snapshot prefix was rewritten; retry sync')
+        digest = records.hasher.copy()
+        for path in self.dependencies:
+            expected = records.dependencies.get(str(path))
+            if expected is None or path.read_bytes() != expected:
+                raise SourceError('Source metadata changed during parsing; retry sync')
+            digest.update(str(path).encode('utf-8'))
+            digest.update(expected)
+        return digest.hexdigest()
+
+
+def read_records(path):
+    """Keep physical line numbers. Defer a torn final record, fail bad complete rows."""
+    records, warnings = SnapshotRecords(path), []
+    with path.open('rb') as stream:
+        for index, line in enumerate(stream):
+            records.hasher.update(line)
+            records.byte_count += len(line)
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line.decode('utf-8-sig'))
+            except (ValueError, UnicodeError) as exc:
+                if not line.endswith(b'\n'):
+                    warnings.append(f'Incomplete trailing record at line {index + 1}; retry on next sync')
+                    break
+                raise SourceError(f'Invalid JSON at line {index + 1}') from exc
+            if not isinstance(value, dict):
+                raise SourceError(f'Expected an object at line {index + 1}')
+            records.append((index, value))
+    records.modified_ns = path.stat().st_mtime_ns
+    return records, warnings
+
+
+def read_json(path, keep_bytes=False):
+    payload = path.read_bytes()
+    modified = path.stat().st_mtime_ns
+    value = json.loads(payload.decode('utf-8-sig'))
+    if not isinstance(value, dict):
+        raise SourceError('Expected a JSON object')
+    value = SnapshotObject(value)
+    value.snapshot_hasher = hashlib.sha256(str(path).encode('utf-8') + payload)
+    value.snapshot_byte_count = len(payload)
+    value.snapshot_modified_ns = modified
+    value.snapshot_bytes = payload if keep_bytes else None
+    return value
+
+
+class SourceAdapter:
+    source = ''
+    label = ''
+    parser_version = 1
+
+    def __init__(self, roots):
+        self.roots = [Path(os.path.expandvars(str(root))).expanduser().resolve() for root in roots]
+
+    def files(self, patterns):
+        seen = set()
+        for root in self.roots:
+            if not root.exists():
+                continue
+            for pattern in patterns:
+                candidates = [root] if root.is_file() else root.glob(pattern)
+                for candidate in candidates:
+                    if not candidate.is_file():
+                        continue
+                    resolved = candidate.resolve()
+                    allowed = root.parent if root.is_file() else root
+                    if not resolved.is_relative_to(allowed):
+                        continue  # Never follow links outside an explicitly configured root.
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        yield resolved
+
+    def discover(self):
+        return [SourceFile(path) for path in self.files(['**/*.jsonl'])]
+
+    def info(self):
+        return {'id': self.source, 'label': self.label,
+                'roots': [str(p) for p in self.roots],
+                'available': any(p.exists() for p in self.roots),
+                'capabilities': {'sourceDelete': False, 'readOnly': True}}
